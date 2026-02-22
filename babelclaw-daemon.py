@@ -224,10 +224,15 @@ def process_once(cfg: dict[str, Any], verbose: bool = False, force_seed_only: bo
             continue
 
         pulled: list[Any] = []
-        for i, msg in enumerate(client.messages.list(chat_id=chat.id)):
-            pulled.append(msg)
-            if i + 1 >= int(cfg.get("messages_per_chat", 5)):
-                break
+        try:
+            for i, msg in enumerate(client.messages.list(chat_id=chat.id)):
+                pulled.append(msg)
+                if i + 1 >= int(cfg.get("messages_per_chat", 5)):
+                    break
+        except Exception as e:
+            if verbose:
+                print(f"[skip-chat] unreadable chat {chat_title or chat_id}: {e}")
+            continue
 
         pulled.reverse()
 
