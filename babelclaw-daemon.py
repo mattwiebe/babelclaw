@@ -91,6 +91,7 @@ def default_config() -> dict[str, Any]:
         "to_language": "English",
         "regional_context": "Mexican/LatAm",
         "output_flag": "🇲🇽",
+        "log_ignored_messages": False,
     }
 
 
@@ -278,7 +279,7 @@ def process_once(cfg: dict[str, Any], verbose: bool = False, force_seed_only: bo
                 continue
 
             if result == "IGNORE":
-                if verbose:
+                if verbose and cfg.get("log_ignored_messages", False):
                     print(f"[skip] IGNORE: {sender}: {text[:80]}")
                 continue
 
@@ -427,6 +428,10 @@ def cmd_install(_args: argparse.Namespace) -> None:
     ignored_titles_raw = input("Ignored chat title contains (comma-separated, optional): ").strip()
     ignored_titles = [x.strip() for x in ignored_titles_raw.split(",") if x.strip()]
 
+    log_ignored_default = "y" if cfg.get("log_ignored_messages") else "n"
+    log_ignored_raw = input(f"Log ignored/non-matching messages? [y/N, default {log_ignored_default.upper()}]: ").strip().lower()
+    log_ignored = cfg.get("log_ignored_messages") if not log_ignored_raw else (log_ignored_raw in {"y", "yes"})
+
     cfg["beeper_access_token"] = token
     cfg["lmstudio_model"] = model
     cfg["discord_target"] = target
@@ -437,6 +442,7 @@ def cmd_install(_args: argparse.Namespace) -> None:
     cfg["ignored_networks"] = ignored_networks
     cfg["ignored_chat_ids"] = ignored_chat_ids
     cfg["ignored_chat_title_contains"] = ignored_titles
+    cfg["log_ignored_messages"] = log_ignored
     if interval_raw:
         cfg["interval_seconds"] = max(2, int(interval_raw))
 
