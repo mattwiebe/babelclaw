@@ -13,11 +13,11 @@ Language-aware Beeper bridge that uses local LM Studio inference to translate in
 
 ## Requirements
 
-- macOS
 - [uv](https://docs.astral.sh/uv/)
 - Beeper Desktop with Desktop API enabled
 - LM Studio local server (OpenAI-compatible API)
 - OpenClaw CLI configured with Discord access
+- macOS (only required if you want launchd/LaunchAgent auto-start)
 
 ## Install / Onboard
 
@@ -29,9 +29,9 @@ This will:
 - prompt for Beeper token
 - prompt for LM Studio model (uses `lms` if available)
 - write config to `~/.config/babelclaw-daemon/config.json`
-- write launchd plist to `~/Library/LaunchAgents/com.mattwiebe.babelclaw-daemon.plist`
 - reset state for safe first run
-- load/start the launchd service
+- on macOS: write/load `~/Library/LaunchAgents/com.mattwiebe.babelclaw-daemon.plist`
+- on non-macOS: skip launchd and print the `uv run --script ... run --verbose` command to start manually
 
 ## Manual run
 

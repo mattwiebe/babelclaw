@@ -26,6 +26,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -417,21 +418,25 @@ def cmd_install(_args: argparse.Namespace) -> None:
     save_json(CONFIG_PATH, cfg)
     print(f"\nSaved config: {CONFIG_PATH}")
 
-    plist = build_launchd_plist(interval_seconds=int(cfg.get("interval_seconds")))
-    PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PLIST_PATH.write_text(plist)
-    print(f"Wrote launchd plist: {PLIST_PATH}")
-
     # Reset state so first daemon run auto-seeds and does not spam historical messages.
     save_json(STATE_PATH, {"seen": {}, "bootstrapped": False, "updated_at": now_iso()})
     print(f"Reset state for safe first run: {STATE_PATH}")
 
-    subprocess.run(["launchctl", "unload", str(PLIST_PATH)], capture_output=True)
-    load = subprocess.run(["launchctl", "load", str(PLIST_PATH)], capture_output=True, text=True)
-    if load.returncode == 0:
-        print("launchd service loaded and started.")
+    if sys.platform == "darwin":
+        plist = build_launchd_plist(interval_seconds=int(cfg.get("interval_seconds")))
+        PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PLIST_PATH.write_text(plist)
+        print(f"Wrote launchd plist: {PLIST_PATH}")
+
+        subprocess.run(["launchctl", "unload", str(PLIST_PATH)], capture_output=True)
+        load = subprocess.run(["launchctl", "load", str(PLIST_PATH)], capture_output=True, text=True)
+        if load.returncode == 0:
+            print("launchd service loaded and started.")
+        else:
+            print(f"launchd load warning: {load.stderr.strip() or load.stdout.strip()}")
     else:
-        print(f"launchd load warning: {load.stderr.strip() or load.stdout.strip()}")
+        print("Non-macOS detected: skipping launchd setup.")
+        print(f"Run manually: uv run --script {SCRIPT_PATH} run --verbose")
 
 
 def cmd_run(args: argparse.Namespace) -> None:
@@ -452,12 +457,15 @@ def cmd_once(args: argparse.Namespace) -> None:
 
 
 def cmd_uninstall(args: argparse.Namespace) -> None:
-    subprocess.run(["launchctl", "unload", str(PLIST_PATH)], capture_output=True)
-    if PLIST_PATH.exists():
-        PLIST_PATH.unlink()
-        print(f"Removed plist: {PLIST_PATH}")
+    if sys.platform == "darwin":
+        subprocess.run(["launchctl", "unload", str(PLIST_PATH)], capture_output=True)
+        if PLIST_PATH.exists():
+            PLIST_PATH.unlink()
+            print(f"Removed plist: {PLIST_PATH}")
+        else:
+            print(f"Plist not found (already removed): {PLIST_PATH}")
     else:
-        print(f"Plist not found (already removed): {PLIST_PATH}")
+        print("Non-macOS detected: no launchd plist to remove.")
 
     if args.delete_config and CONFIG_PATH.exists():
         CONFIG_PATH.unlink()
