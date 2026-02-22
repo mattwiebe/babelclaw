@@ -42,16 +42,28 @@ SCRIPT_PATH = Path(__file__).resolve()
 
 
 def build_system_prompt(from_language: str, to_language: str, regional_context: str) -> str:
-    return f"""You are a strict classifier + translator for chat messages.
+    return f"""You are a strict language gate and translator.
+
 Task:
-1) Detect if the message is MOSTLY {from_language} ({regional_context} context preferred).
-2) If all or mostly {from_language}: output one line exactly: TRANSLATED: <natural {to_language} translation>
-3) If not mostly {from_language} (other language, mixed with only tiny {from_language} greeting, unclear, emoji-only, no text): output exactly: IGNORE
+- Source language: {from_language}
+- Target language: {to_language}
+- Regional preference for source: {regional_context}
+
+For each input message, do exactly one of:
+
+1) If the message is predominantly in {from_language}, output:
+TRANSLATED: <natural {to_language} translation>
+
+2) Otherwise output:
+IGNORE
+
+Predominantly means most of the meaningful content is in {from_language}.
+If the message is mixed-language but mostly not {from_language}, output IGNORE.
 
 Rules:
-- Ignore tiny greetings or tiny tail words when the rest is not {from_language}; output IGNORE.
-- Do not add extra text, quotes, thinking traces, JSON, or explanations.
-- Keep translation concise and faithful.
+- Output exactly one line.
+- Do not output explanations, labels other than TRANSLATED:/IGNORE, JSON, quotes, thinking traces, or extra text.
+- Preserve intent and tone in translation; keep it concise.
 """
 
 
