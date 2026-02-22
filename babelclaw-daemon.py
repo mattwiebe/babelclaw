@@ -334,6 +334,8 @@ def choose_model_interactive(default_model: str) -> str:
 
 
 def build_launchd_plist(interval_seconds: int) -> str:
+    uv_bin = shutil.which("uv") or "/opt/homebrew/bin/uv"
+    path_env = os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
     return f"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
 <plist version=\"1.0\">
@@ -343,7 +345,7 @@ def build_launchd_plist(interval_seconds: int) -> str:
 
   <key>ProgramArguments</key>
   <array>
-    <string>uv</string>
+    <string>{uv_bin}</string>
     <string>run</string>
     <string>{SCRIPT_PATH}</string>
     <string>run</string>
@@ -363,6 +365,10 @@ def build_launchd_plist(interval_seconds: int) -> str:
   <dict>
     <key>PYTHONUNBUFFERED</key>
     <string>1</string>
+    <key>PATH</key>
+    <string>{path_env}</string>
+    <key>HOME</key>
+    <string>{Path.home()}</string>
   </dict>
 
   <key>StandardOutPath</key>
