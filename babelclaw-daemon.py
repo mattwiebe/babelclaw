@@ -200,7 +200,14 @@ def process_once(cfg: dict[str, Any], verbose: bool = False, force_seed_only: bo
     ignored_chat_ids = {str(x).strip() for x in cfg.get("ignored_chat_ids", []) if str(x).strip()}
     ignored_title_contains = [str(x).strip().lower() for x in cfg.get("ignored_chat_title_contains", []) if str(x).strip()]
 
-    for chat in client.chats.list():
+    try:
+        chats = list(client.chats.list())
+    except Exception as e:
+        if verbose:
+            print(f"[warn] Could not list chats: {e}")
+        chats = []
+
+    for chat in chats:
         chat_id = getattr(chat, "id", "")
         chat_network = str(getattr(chat, "network", "") or "").lower()
         chat_title = str(getattr(chat, "title", "") or "")
