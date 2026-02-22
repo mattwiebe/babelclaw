@@ -295,23 +295,30 @@ def process_once(cfg: dict[str, Any], verbose: bool = False, force_seed_only: bo
 def choose_model_interactive(default_model: str) -> str:
     models: list[str] = []
     if shutil.which("lms"):
-        for cmd in (["lms", "ls"], ["lms", "list"]):
-            proc = subprocess.run(cmd, capture_output=True, text=True)
-            if proc.returncode == 0 and proc.stdout.strip():
-                lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
-                # Skip common headers and keep first token as model name.
-                for line in lines:
-                    lower = line.lower()
-                    if "model" in lower and ("status" in lower or "size" in lower):
+        proc = subprocess.run(["lms", "ls", "--llm", "--json"], capture_output=True, text=True)
+        if proc.returncode == 0 and proc.stdout.strip():
+            try:
+                payload = json.loads(proc.stdout)
+                items = payload if isinstance(payload, list) else payload.get("data", [])
+                for item in items:
+                    if not isinstance(item, dict):
                         continue
-                    token = line.split()[0]
-                    if token and token not in models:
-                        models.append(token)
-                if models:
-                    break
+                    model_id = (
+                        item.get("modelKey")
+                        or item.get("id")
+                        or item.get("identifier")
+                        or item.get("slug")
+                        or item.get("name")
+                    )
+                    if model_id:
+                        model_id = str(model_id).strip()
+                        if model_id and model_id not in models:
+                            models.append(model_id)
+            except Exception:
+                models = []
 
     if models:
-        print("\nAvailable LM Studio models (from `lms`):")
+        print("\nAvailable LM Studio LLM models (from `lms ls --llm --json`):")
         for i, m in enumerate(models, start=1):
             print(f"  {i}. {m}")
         choice = input(f"Choose model [default {default_model}]: ").strip()
@@ -321,7 +328,7 @@ def choose_model_interactive(default_model: str) -> str:
             return models[int(choice) - 1]
         return choice
 
-    print("\nCould not read models via `lms` in this shell.")
+    print("\nCould not read LLM models via `lms ls --llm --json` in this shell.")
     value = input(f"Enter LM Studio model id [default {default_model}]: ").strip()
     return value or default_model
 
