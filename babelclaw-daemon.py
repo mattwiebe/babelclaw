@@ -83,7 +83,8 @@ def default_config() -> dict[str, Any]:
         "messages_per_chat": 5,
         "send_retries": 3,
         "dedupe_hours": 24,
-        "search_limit": 250,
+        "search_limit": 20,
+        "openclaw_bin": shutil.which("openclaw") or "openclaw",
         "ignore_muted_chats": True,
         "ignored_networks": ["discord"],
         "ignored_chat_ids": [],
@@ -157,9 +158,9 @@ def classify_or_translate(
         return data["choices"][0]["message"]["content"].strip()
 
 
-def send_to_discord(target: str, body: str, retries: int = 3) -> None:
+def send_to_discord(openclaw_bin: str, target: str, body: str, retries: int = 3) -> None:
     cmd = [
-        "openclaw",
+        openclaw_bin,
         "message",
         "send",
         "--channel",
@@ -224,7 +225,7 @@ def process_once(cfg: dict[str, Any], verbose: bool = False, force_seed_only: bo
     chat_by_id = {str(getattr(c, "id", "")): c for c in chats}
 
     date_after = state.get("last_poll_at") or poll_started_at
-    limit = int(cfg.get("search_limit", 250))
+    limit = max(1, min(20, int(cfg.get("search_limit", 20))))
 
     try:
         recent_messages = list(
@@ -299,7 +300,12 @@ def process_once(cfg: dict[str, Any], verbose: bool = False, force_seed_only: bo
             translation = result.split("TRANSLATED:", 1)[1].strip()
             out = f"{cfg.get('output_flag', '🇲🇽')} {translation} — {sender}"
             try:
-                send_to_discord(cfg["discord_target"], out, retries=int(cfg.get("send_retries", 3)))
+                send_to_discord(
+                    cfg.get("openclaw_bin") or shutil.which("openclaw") or "openclaw",
+                    cfg["discord_target"],
+                    out,
+                    retries=int(cfg.get("send_retries", 3)),
+                )
                 translated_count += 1
                 if verbose:
                     print(f"[sent] {out}")
@@ -461,6 +467,7 @@ def cmd_install(_args: argparse.Namespace) -> None:
     cfg["ignored_chat_title_contains"] = ignored_titles
     cfg["log_ignored_messages"] = log_ignored
     cfg["log_chat_skips"] = log_skips
+    cfg["openclaw_bin"] = cfg.get("openclaw_bin") or shutil.which("openclaw") or "openclaw"
     if interval_raw:
         cfg["interval_seconds"] = max(2, int(interval_raw))
 
