@@ -22,7 +22,7 @@ Language-aware Beeper bridge that uses local LM Studio inference to translate in
 ## Install / Onboard
 
 ```bash
-uv run --script scripts/babelclaw-daemon.py install
+uv run --script babelclaw-daemon.py install
 ```
 
 This will:
@@ -36,25 +36,25 @@ This will:
 ## Manual run
 
 ```bash
-uv run --script scripts/babelclaw-daemon.py run --verbose
+uv run --script babelclaw-daemon.py run --verbose
 ```
 
 One pass only:
 
 ```bash
-uv run --script scripts/babelclaw-daemon.py once --verbose
+uv run --script babelclaw-daemon.py once --verbose
 ```
 
 ## Uninstall
 
 ```bash
-uv run --script scripts/babelclaw-daemon.py uninstall
+uv run --script babelclaw-daemon.py uninstall
 ```
 
 Optionally remove local files too:
 
 ```bash
-uv run --script scripts/babelclaw-daemon.py uninstall --delete-config --delete-state
+uv run --script babelclaw-daemon.py uninstall --delete-config --delete-state
 ```
 
 ## License
