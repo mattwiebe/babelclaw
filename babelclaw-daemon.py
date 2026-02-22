@@ -83,6 +83,7 @@ def default_config() -> dict[str, Any]:
         "messages_per_chat": 5,
         "send_retries": 3,
         "dedupe_hours": 24,
+        "search_limit": 250,
         "ignore_muted_chats": True,
         "ignored_networks": ["discord"],
         "ignored_chat_ids": [],
@@ -188,12 +189,23 @@ def message_key(msg: Any) -> str:
 
 
 def process_once(cfg: dict[str, Any], verbose: bool = False, force_seed_only: bool = False) -> int:
-    state = load_json(STATE_PATH, {"seen": {}, "bootstrapped": False, "updated_at": None})
+    state = load_json(
+        STATE_PATH,
+        {"seen": {}, "bootstrapped": False, "last_poll_at": None, "updated_at": None},
+    )
     seen = prune_seen(state.get("seen", {}), max_age_hours=int(cfg.get("dedupe_hours", 24)))
 
+    poll_started_at = now_iso()
     first_run_seed = force_seed_only or not state.get("bootstrapped", False)
-    if first_run_seed and verbose:
-        print("[info] First run detected (no dedupe history). Seeding seen messages only.")
+    if first_run_seed:
+        if verbose:
+            print("[info] First run detected. Setting cursor to now and waiting for new messages.")
+        state["seen"] = seen
+        state["bootstrapped"] = True
+        state["last_poll_at"] = poll_started_at
+        state["updated_at"] = poll_started_at
+        save_json(STATE_PATH, state)
+        return 0
 
     client = beeper_client(cfg["beeper_access_token"])
     translated_count = 0
@@ -205,102 +217,102 @@ def process_once(cfg: dict[str, Any], verbose: bool = False, force_seed_only: bo
     try:
         chats = list(client.chats.list())
     except Exception as e:
-        if verbose:
+        if verbose and cfg.get("log_chat_skips", False):
             print(f"[warn] Could not list chats: {e}")
         chats = []
 
-    for chat in chats:
-        chat_id = getattr(chat, "id", "")
-        chat_network = str(getattr(chat, "network", "") or "").lower()
-        chat_title = str(getattr(chat, "title", "") or "")
-        chat_muted = bool(getattr(chat, "is_muted", False) or getattr(chat, "muted", False))
+    chat_by_id = {str(getattr(c, "id", "")): c for c in chats}
+
+    date_after = state.get("last_poll_at") or poll_started_at
+    limit = int(cfg.get("search_limit", 250))
+
+    try:
+        recent_messages = list(
+            client.messages.search(
+                date_after=date_after,
+                include_muted=True,
+                limit=limit,
+                direction="after",
+            )
+        )
+    except Exception as e:
+        if verbose:
+            print(f"[warn] Could not search recent messages: {e}")
+        recent_messages = []
+
+    def msg_ts(m: Any) -> str:
+        return str(getattr(m, "timestamp", "") or "")
+
+    recent_messages.sort(key=msg_ts)
+
+    for msg in recent_messages:
+        if getattr(msg, "is_sender", False):
+            continue
+
+        key = message_key(msg)
+        if key in seen:
+            continue
+
+        chat_id = str(getattr(msg, "chat_id", "") or "")
+        chat = chat_by_id.get(chat_id)
+        chat_network = str(getattr(chat, "network", "") or "").lower() if chat else ""
+        chat_title = str(getattr(chat, "title", "") or "") if chat else chat_id
+        chat_muted = bool(getattr(chat, "is_muted", False) or getattr(chat, "muted", False)) if chat else False
 
         if cfg.get("ignore_muted_chats", True) and chat_muted:
-            if verbose and cfg.get("log_chat_skips", False):
-                print(f"[skip-chat] muted: {chat_title or chat_id}")
             continue
         if chat_network and chat_network in ignored_networks:
-            if verbose and cfg.get("log_chat_skips", False):
-                print(f"[skip-chat] ignored network={chat_network}: {chat_title or chat_id}")
             continue
-        if chat_id in ignored_chat_ids:
-            if verbose and cfg.get("log_chat_skips", False):
-                print(f"[skip-chat] ignored chat id: {chat_title or chat_id}")
+        if chat_id and chat_id in ignored_chat_ids:
             continue
         if chat_title and any(snippet in chat_title.lower() for snippet in ignored_title_contains):
-            if verbose and cfg.get("log_chat_skips", False):
-                print(f"[skip-chat] ignored title match: {chat_title}")
             continue
 
-        pulled: list[Any] = []
-        try:
-            for i, msg in enumerate(client.messages.list(chat_id=chat.id)):
-                pulled.append(msg)
-                if i + 1 >= int(cfg.get("messages_per_chat", 5)):
-                    break
-        except Exception as e:
-            if verbose and cfg.get("log_chat_skips", False):
-                print(f"[skip-chat] unreadable chat {chat_title or chat_id}: {e}")
-            continue
-
-        pulled.reverse()
-
-        for msg in pulled:
-            if getattr(msg, "is_sender", False):
-                continue
-
-            text = (getattr(msg, "text", "") or "").strip()
-            if not text:
-                continue
-
-            key = message_key(msg)
-            if key in seen:
-                continue
-
+        text = (getattr(msg, "text", "") or "").strip()
+        if not text:
             seen[key] = {"first_seen_epoch": now_epoch()}
-            sender = getattr(msg, "sender_name", None) or getattr(msg, "sender_id", "unknown")
+            continue
 
-            if first_run_seed:
-                if verbose:
-                    print(f"[seed] {sender}: {text[:80]}")
-                continue
+        seen[key] = {"first_seen_epoch": now_epoch()}
+        sender = getattr(msg, "sender_name", None) or getattr(msg, "sender_id", "unknown")
 
-            try:
-                result = classify_or_translate(
-                    cfg["lmstudio_base_url"],
-                    cfg["lmstudio_model"],
-                    text,
-                    cfg.get("from_language", "Spanish"),
-                    cfg.get("to_language", "English"),
-                    cfg.get("regional_context", "Mexican/LatAm"),
-                )
-            except Exception as e:
-                if verbose:
-                    print(f"[warn] LM Studio classify failed for {key}: {e}")
-                continue
-
-            if result == "IGNORE":
-                if verbose and cfg.get("log_ignored_messages", False):
-                    print(f"[skip] IGNORE: {sender}: {text[:80]}")
-                continue
-
-            if result.startswith("TRANSLATED:"):
-                translation = result.split("TRANSLATED:", 1)[1].strip()
-                out = f"{cfg.get('output_flag', '🇲🇽')} {translation} — {sender}"
-                try:
-                    send_to_discord(cfg["discord_target"], out, retries=int(cfg.get("send_retries", 3)))
-                    translated_count += 1
-                    if verbose:
-                        print(f"[sent] {out}")
-                except Exception as e:
-                    print(f"[error] Discord send failed for {key}: {e}")
-                continue
-
+        try:
+            result = classify_or_translate(
+                cfg["lmstudio_base_url"],
+                cfg["lmstudio_model"],
+                text,
+                cfg.get("from_language", "Spanish"),
+                cfg.get("to_language", "English"),
+                cfg.get("regional_context", "Mexican/LatAm"),
+            )
+        except Exception as e:
             if verbose:
-                print(f"[skip] Unrecognized model output: {result!r}")
+                print(f"[warn] LM Studio classify failed for {key}: {e}")
+            continue
+
+        if result == "IGNORE":
+            if verbose and cfg.get("log_ignored_messages", False):
+                print(f"[skip] IGNORE: {sender}: {text[:80]}")
+            continue
+
+        if result.startswith("TRANSLATED:"):
+            translation = result.split("TRANSLATED:", 1)[1].strip()
+            out = f"{cfg.get('output_flag', '🇲🇽')} {translation} — {sender}"
+            try:
+                send_to_discord(cfg["discord_target"], out, retries=int(cfg.get("send_retries", 3)))
+                translated_count += 1
+                if verbose:
+                    print(f"[sent] {out}")
+            except Exception as e:
+                print(f"[error] Discord send failed for {key}: {e}")
+            continue
+
+        if verbose:
+            print(f"[skip] Unrecognized model output: {result!r}")
 
     state["seen"] = seen
     state["bootstrapped"] = True
+    state["last_poll_at"] = poll_started_at
     state["updated_at"] = now_iso()
     save_json(STATE_PATH, state)
     return translated_count
