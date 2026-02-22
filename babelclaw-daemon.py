@@ -92,6 +92,7 @@ def default_config() -> dict[str, Any]:
         "regional_context": "Mexican/LatAm",
         "output_flag": "🇲🇽",
         "log_ignored_messages": False,
+        "log_chat_skips": False,
     }
 
 
@@ -215,19 +216,19 @@ def process_once(cfg: dict[str, Any], verbose: bool = False, force_seed_only: bo
         chat_muted = bool(getattr(chat, "is_muted", False) or getattr(chat, "muted", False))
 
         if cfg.get("ignore_muted_chats", True) and chat_muted:
-            if verbose:
+            if verbose and cfg.get("log_chat_skips", False):
                 print(f"[skip-chat] muted: {chat_title or chat_id}")
             continue
         if chat_network and chat_network in ignored_networks:
-            if verbose:
+            if verbose and cfg.get("log_chat_skips", False):
                 print(f"[skip-chat] ignored network={chat_network}: {chat_title or chat_id}")
             continue
         if chat_id in ignored_chat_ids:
-            if verbose:
+            if verbose and cfg.get("log_chat_skips", False):
                 print(f"[skip-chat] ignored chat id: {chat_title or chat_id}")
             continue
         if chat_title and any(snippet in chat_title.lower() for snippet in ignored_title_contains):
-            if verbose:
+            if verbose and cfg.get("log_chat_skips", False):
                 print(f"[skip-chat] ignored title match: {chat_title}")
             continue
 
@@ -238,7 +239,7 @@ def process_once(cfg: dict[str, Any], verbose: bool = False, force_seed_only: bo
                 if i + 1 >= int(cfg.get("messages_per_chat", 5)):
                     break
         except Exception as e:
-            if verbose:
+            if verbose and cfg.get("log_chat_skips", False):
                 print(f"[skip-chat] unreadable chat {chat_title or chat_id}: {e}")
             continue
 
@@ -432,6 +433,10 @@ def cmd_install(_args: argparse.Namespace) -> None:
     log_ignored_raw = input(f"Log ignored/non-matching messages? [y/N, default {log_ignored_default.upper()}]: ").strip().lower()
     log_ignored = cfg.get("log_ignored_messages") if not log_ignored_raw else (log_ignored_raw in {"y", "yes"})
 
+    log_skips_default = "y" if cfg.get("log_chat_skips") else "n"
+    log_skips_raw = input(f"Log skipped/unreadable chats? [y/N, default {log_skips_default.upper()}]: ").strip().lower()
+    log_skips = cfg.get("log_chat_skips") if not log_skips_raw else (log_skips_raw in {"y", "yes"})
+
     cfg["beeper_access_token"] = token
     cfg["lmstudio_model"] = model
     cfg["discord_target"] = target
@@ -443,6 +448,7 @@ def cmd_install(_args: argparse.Namespace) -> None:
     cfg["ignored_chat_ids"] = ignored_chat_ids
     cfg["ignored_chat_title_contains"] = ignored_titles
     cfg["log_ignored_messages"] = log_ignored
+    cfg["log_chat_skips"] = log_skips
     if interval_raw:
         cfg["interval_seconds"] = max(2, int(interval_raw))
 
