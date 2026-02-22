@@ -16,6 +16,7 @@ Subcommands:
   install    Interactive onboarding + write config + install launchd plist
   run        Run daemon loop
   once       Run one processing pass and exit
+  doctor     Validate binary paths and OpenClaw messaging dry-run
   uninstall  Unload launchd plist + optional config/state cleanup
 """
 
@@ -106,9 +107,9 @@ def load_config() -> dict[str, Any]:
         os.environ.get("BEEPER_ACCESS_TOKEN")
         or cfg.get("beeper_access_token", "")
     )
-    cfg["lmstudio_base_url"] = subprocess.os.environ.get("LMSTUDIO_BASE_URL") or cfg.get("lmstudio_base_url")
-    cfg["lmstudio_model"] = subprocess.os.environ.get("LMSTUDIO_MODEL") or cfg.get("lmstudio_model")
-    cfg["discord_target"] = subprocess.os.environ.get("DISCORD_TARGET") or cfg.get("discord_target")
+    cfg["lmstudio_base_url"] = os.environ.get("LMSTUDIO_BASE_URL") or cfg.get("lmstudio_base_url")
+    cfg["lmstudio_model"] = os.environ.get("LMSTUDIO_MODEL") or cfg.get("lmstudio_model")
+    cfg["discord_target"] = os.environ.get("DISCORD_TARGET") or cfg.get("discord_target")
 
     if not cfg.get("beeper_access_token"):
         raise RuntimeError(
@@ -116,6 +117,28 @@ def load_config() -> dict[str, Any]:
         )
 
     return cfg
+
+
+def resolve_openclaw_bin(cfg: dict[str, Any]) -> str | None:
+    configured = str(cfg.get("openclaw_bin") or "").strip()
+    if configured and Path(configured).exists():
+        return configured
+    discovered = shutil.which("openclaw")
+    if discovered:
+        return discovered
+    return None
+
+
+def validate_install_environment() -> tuple[str, str]:
+    uv_bin = shutil.which("uv")
+    if not uv_bin:
+        raise RuntimeError("`uv` not found in PATH. Install uv first.")
+
+    openclaw_bin = shutil.which("openclaw")
+    if not openclaw_bin:
+        raise RuntimeError("`openclaw` not found in PATH. Install/configure OpenClaw CLI first.")
+
+    return uv_bin, openclaw_bin
 
 
 def prune_seen(seen: dict[str, dict[str, int]], max_age_hours: int) -> dict[str, dict[str, int]]:
@@ -415,8 +438,12 @@ def build_launchd_plist(interval_seconds: int) -> str:
 def cmd_install(_args: argparse.Namespace) -> None:
     cfg = load_json(CONFIG_PATH, default_config())
 
+    uv_bin, openclaw_bin = validate_install_environment()
+
     print("BabelClaw daemon onboarding")
     print("-------------------------------------------")
+    print(f"Detected uv: {uv_bin}")
+    print(f"Detected openclaw: {openclaw_bin}")
 
     token = input("Beeper access token (required): ").strip()
     if not token:
@@ -467,7 +494,7 @@ def cmd_install(_args: argparse.Namespace) -> None:
     cfg["ignored_chat_title_contains"] = ignored_titles
     cfg["log_ignored_messages"] = log_ignored
     cfg["log_chat_skips"] = log_skips
-    cfg["openclaw_bin"] = cfg.get("openclaw_bin") or shutil.which("openclaw") or "openclaw"
+    cfg["openclaw_bin"] = openclaw_bin
     if interval_raw:
         cfg["interval_seconds"] = max(2, int(interval_raw))
 
@@ -495,8 +522,20 @@ def cmd_install(_args: argparse.Namespace) -> None:
         print(f"Run manually: uv run --script {SCRIPT_PATH} run --verbose")
 
 
+def apply_runtime_path_fallbacks(cfg: dict[str, Any], verbose: bool = False) -> dict[str, Any]:
+    resolved_openclaw = resolve_openclaw_bin(cfg)
+    configured = str(cfg.get("openclaw_bin") or "").strip()
+    if not resolved_openclaw:
+        raise RuntimeError("OpenClaw CLI binary not found. Set openclaw_bin in config or add `openclaw` to PATH.")
+    if configured != resolved_openclaw and verbose:
+        print(f"[warn] openclaw_bin invalid/missing ({configured or 'unset'}), using: {resolved_openclaw}")
+    cfg["openclaw_bin"] = resolved_openclaw
+    cfg["search_limit"] = max(1, min(20, int(cfg.get("search_limit", 20))))
+    return cfg
+
+
 def cmd_run(args: argparse.Namespace) -> None:
-    cfg = load_config()
+    cfg = apply_runtime_path_fallbacks(load_config(), verbose=args.verbose)
     interval = int(args.interval) if args.interval is not None else int(cfg.get("interval_seconds"))
 
     while True:
@@ -508,8 +547,50 @@ def cmd_run(args: argparse.Namespace) -> None:
 
 
 def cmd_once(args: argparse.Namespace) -> None:
-    cfg = load_config()
+    cfg = apply_runtime_path_fallbacks(load_config(), verbose=args.verbose)
     process_once(cfg, verbose=args.verbose, force_seed_only=args.seed_seen)
+
+
+def cmd_doctor(_args: argparse.Namespace) -> None:
+    print("BabelClaw doctor")
+    print("----------------")
+
+    uv_bin = shutil.which("uv")
+    openclaw_bin = shutil.which("openclaw")
+
+    print(f"uv: {'OK' if uv_bin else 'MISSING'} {uv_bin or ''}")
+    print(f"openclaw (PATH): {'OK' if openclaw_bin else 'MISSING'} {openclaw_bin or ''}")
+
+    cfg_exists = CONFIG_PATH.exists()
+    print(f"config: {'OK' if cfg_exists else 'MISSING'} {CONFIG_PATH}")
+
+    if cfg_exists:
+        cfg = load_json(CONFIG_PATH, default_config())
+        configured_openclaw = cfg.get("openclaw_bin")
+        print(f"openclaw_bin (config): {configured_openclaw}")
+        resolved = resolve_openclaw_bin(cfg)
+        print(f"openclaw_bin (resolved): {resolved or 'MISSING'}")
+
+        if resolved:
+            dry = subprocess.run(
+                [
+                    resolved,
+                    "message",
+                    "send",
+                    "--channel",
+                    "discord",
+                    "--target",
+                    str(cfg.get("discord_target") or "#cassiel"),
+                    "--message",
+                    "BabelClaw doctor dry-run",
+                    "--dry-run",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            print(f"openclaw send dry-run: {'OK' if dry.returncode == 0 else 'FAIL'}")
+            if dry.returncode != 0:
+                print((dry.stderr or dry.stdout).strip())
 
 
 def cmd_uninstall(args: argparse.Namespace) -> None:
@@ -550,6 +631,9 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--seed-seen", action="store_true", help="Force seed mode (mark seen, send nothing)")
         p.add_argument("--interval", type=int, default=None, help="Loop interval seconds (run only)") if name == "run" else None
         p.set_defaults(func=fn)
+
+    p_doctor = sub.add_parser("doctor", help="Validate binary paths and OpenClaw dry-run")
+    p_doctor.set_defaults(func=cmd_doctor)
 
     p_uninstall = sub.add_parser("uninstall", help="Unload launchd plist and optionally remove files")
     p_uninstall.add_argument("--delete-config", action="store_true", help="Also delete config file")
