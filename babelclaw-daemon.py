@@ -49,7 +49,7 @@ Task:
 3) If not mostly {from_language} (other language, mixed with only tiny {from_language} greeting, unclear, emoji-only, no text): output exactly: IGNORE
 
 Rules:
-- Ignore tiny greetings (e.g. a brief hello) when the rest is not {from_language}; output IGNORE.
+- Ignore tiny greetings or tiny tail words (e.g. "I am doing well today, gracias") when the rest is not {from_language}; output IGNORE.
 - Do not add extra text, quotes, thinking traces, JSON, or explanations.
 - Keep translation concise and faithful.
 """
@@ -150,6 +150,36 @@ def beeper_client(token: str):
     from beeper_desktop_api import BeeperDesktop
 
     return BeeperDesktop(access_token=token)
+
+
+def likely_english_with_tiny_spanish_tail(text: str, from_language: str) -> bool:
+    """Cheap guardrail to prevent obvious mixed-English false positives.
+
+    Applies only when translating FROM Spanish.
+    """
+    if from_language.strip().lower() != "spanish":
+        return False
+
+    import re
+
+    tokens = re.findall(r"[A-Za-zÁÉÍÓÚáéíóúÑñ']+", text.lower())
+    if not tokens:
+        return False
+
+    english_markers = {
+        "i", "am", "doing", "well", "today", "thanks", "thank", "you", "the", "and", "is", "are",
+        "to", "of", "for", "with", "on", "in", "my", "your", "we", "it",
+    }
+    spanish_markers = {
+        "hola", "gracias", "como", "estas", "estás", "buenos", "buenas", "dias", "días", "por", "favor",
+        "que", "qué", "de", "la", "el", "y", "muy", "bien", "amigo", "amiga",
+    }
+
+    en = sum(1 for t in tokens if t in english_markers)
+    es = sum(1 for t in tokens if t in spanish_markers)
+
+    # English-dominant + tiny Spanish tail (like "..., gracias") => ignore.
+    return en >= 3 and es <= 2 and en > es
 
 
 def classify_or_translate(
@@ -299,6 +329,11 @@ def process_once(cfg: dict[str, Any], verbose: bool = False, force_seed_only: bo
 
         seen[key] = {"first_seen_epoch": now_epoch()}
         sender = getattr(msg, "sender_name", None) or getattr(msg, "sender_id", "unknown")
+
+        if likely_english_with_tiny_spanish_tail(text, cfg.get("from_language", "Spanish")):
+            if verbose and cfg.get("log_ignored_messages", False):
+                print(f"[skip] MIXED-ENGLISH: {sender}: {text[:80]}")
+            continue
 
         try:
             result = classify_or_translate(
