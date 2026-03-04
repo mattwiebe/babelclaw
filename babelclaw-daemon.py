@@ -23,6 +23,7 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
 import shutil
@@ -38,6 +39,7 @@ import httpx
 CONFIG_PATH = Path.home() / ".config" / "babelclaw-daemon" / "config.json"
 STATE_PATH = Path.home() / ".openclaw" / "state" / "babelclaw-daemon" / "state.json"
 PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / "com.mattwiebe.babelclaw-daemon.plist"
+LAUNCHD_LABEL = "com.mattwiebe.babelclaw-daemon"
 SCRIPT_PATH = Path(__file__).resolve()
 
 
@@ -57,8 +59,8 @@ TRANSLATED: <natural {to_language} translation>
 2) Otherwise output:
 IGNORE
 
-Predominantly means most of the meaningful content is in {from_language}.
-If the message is mixed-language but mostly not {from_language}, output IGNORE.
+Predominantly means at least ~70% of meaningful tokens are in {from_language}.
+If the message is mixed-language, uncertain, or mostly not {from_language}, output IGNORE.
 
 Rules:
 - Output exactly one line.
@@ -86,6 +88,19 @@ def save_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
+def normalize_text(text: str) -> str:
+    return " ".join(str(text or "").strip().split()).casefold()
+
+
+def normalize_name(name: str) -> str:
+    value = str(name or "").strip()
+    if not value:
+        return ""
+    if value[0] in {"#", "@"}:
+        value = value[1:]
+    return normalize_text(value)
+
+
 def default_config() -> dict[str, Any]:
     return {
         "beeper_access_token": "",
@@ -93,15 +108,31 @@ def default_config() -> dict[str, Any]:
         "lmstudio_model": "qwen3-4b-instruct-2507-mlx",
         "discord_target": "#cassiel",
         "interval_seconds": 8,
+        "adaptive_polling": True,
+        "active_interval_seconds": 3,
+        "active_window_seconds": 60,
+        "medium_idle_after_seconds": 300,
+        "idle_interval_seconds": 20,
+        "max_idle_after_seconds": 1800,
+        "max_interval_seconds": 60,
         "messages_per_chat": 5,
         "send_retries": 3,
         "dedupe_hours": 24,
         "search_limit": 20,
+        "chat_metadata_ttl_seconds": 900,
+        "chat_metadata_error_ttl_seconds": 120,
+        "chat_metadata_max_entries": 2000,
         "openclaw_bin": shutil.which("openclaw") or "openclaw",
         "ignore_muted_chats": True,
+        "drop_messages_without_chat_metadata": True,
         "ignored_networks": ["discord"],
         "ignored_chat_ids": [],
         "ignored_chat_title_contains": [],
+        "ignored_sender_names": [],
+        "ignored_sender_name_contains": [],
+        "ignore_recently_sent_echoes": True,
+        "recent_sent_ttl_seconds": 900,
+        "recent_sent_max_entries": 200,
         "from_language": "Spanish",
         "to_language": "English",
         "regional_context": "Mexican/LatAm",
@@ -194,6 +225,103 @@ def likely_english_with_tiny_spanish_tail(text: str, from_language: str) -> bool
     return en >= 3 and es <= 2 and en > es
 
 
+def likely_english_not_spanish(text: str, from_language: str) -> bool:
+    """Conservative local guardrail to avoid obvious English false positives."""
+    if from_language.strip().lower() != "spanish":
+        return False
+
+    import re
+
+    tokens = re.findall(r"[A-Za-zÁÉÍÓÚáéíóúÑñ']+", text.lower())
+    if not tokens:
+        return False
+
+    english_words = {
+        "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "had", "has", "have", "he",
+        "her", "here", "him", "his", "i", "i'm", "if", "in", "into", "is", "it", "its", "just", "me", "my", "not", "of",
+        "on", "or", "our", "over", "please", "replied", "reply", "said", "send", "sent", "she", "since", "that", "the",
+        "their", "them", "then", "there", "they", "this", "to", "today", "tomorrow", "was", "we", "were",
+        "what", "when", "where", "with", "you", "your", "hello", "hey", "thanks", "thank", "message",
+        "meeting", "schedule", "call", "received", "like", "knowing", "things", "long", "yes",
+        "unfortunately", "taken", "politics", "perfect", "okay",
+    }
+    spanish_words = {
+        "que", "qué", "de", "la", "el", "los", "las", "y", "en", "por", "para", "con", "hola", "gracias",
+        "buenos", "buenas", "días", "dias", "cómo", "como", "estás", "estas", "usted", "ustedes", "nosotros",
+        "muy", "bien", "pero", "porque", "también", "tambien", "tengo", "quiero", "puedo", "mensaje",
+    }
+
+    en = sum(1 for t in tokens if t in english_words)
+    es = sum(1 for t in tokens if t in spanish_words)
+    has_spanish_punct = any(ch in text for ch in ("¿", "¡"))
+    has_spanish_diacritics = bool(re.search(r"[áéíóúñÁÉÍÓÚÑ]", text))
+
+    # Short plain-English texts are high-confidence false positives in one-way mode.
+    if len(tokens) <= 2 and es == 0 and en >= 1 and not has_spanish_punct and not has_spanish_diacritics:
+        return True
+
+    # Clear English with little/no Spanish signals.
+    if en >= 3 and es == 0 and not has_spanish_punct and not has_spanish_diacritics:
+        return True
+
+    # Broad English dominance.
+    if en >= 4 and en >= (es + 3):
+        return True
+
+    # Extra guard for medium-length plain ASCII English-like text.
+    if len(tokens) >= 7 and en >= 3 and es <= 1 and not has_spanish_punct and not has_spanish_diacritics:
+        return True
+
+    return False
+
+
+def has_spanish_signals(text: str) -> bool:
+    import re
+
+    lowered = text.lower()
+    if any(ch in text for ch in ("¿", "¡")):
+        return True
+    if re.search(r"[áéíóúñÁÉÍÓÚÑ]", text):
+        return True
+
+    tokens = re.findall(r"[A-Za-zÁÉÍÓÚáéíóúÑñ']+", lowered)
+    if not tokens:
+        return False
+
+    spanish_words = {
+        "que", "qué", "de", "la", "el", "los", "las", "y", "en", "por", "para", "con", "hola", "gracias",
+        "buenos", "buenas", "días", "dias", "cómo", "como", "estás", "estas", "usted", "ustedes", "nosotros",
+        "muy", "bien", "pero", "porque", "también", "tambien", "tengo", "quiero", "puedo", "mensaje",
+    }
+    return sum(1 for t in tokens if t in spanish_words) >= 2
+
+
+def should_accept_translation(source_text: str, translated_text: str, from_language: str) -> bool:
+    """Reject suspicious no-op translations for one-way translation mode."""
+    if from_language.strip().lower() != "spanish":
+        return True
+
+    src = " ".join(source_text.strip().split()).lower()
+    dst = " ".join(translated_text.strip().split()).lower()
+    if not src or not dst:
+        return False
+
+    similarity = difflib.SequenceMatcher(a=src, b=dst).ratio()
+    if similarity >= 0.92 and not has_spanish_signals(source_text):
+        return False
+    return True
+
+
+def is_chat_muted(chat: Any) -> bool:
+    if not chat:
+        return False
+    return bool(
+        getattr(chat, "is_muted", False)
+        or getattr(chat, "muted", False)
+        or getattr(chat, "isMuted", False)
+    )
+
+
 def classify_or_translate(
     base_url: str,
     model: str,
@@ -254,7 +382,12 @@ def message_key(msg: Any) -> str:
     return f"{getattr(msg, 'chat_id', '')}:{getattr(msg, 'timestamp', '')}:{getattr(msg, 'sender_id', '')}"
 
 
-def process_once(cfg: dict[str, Any], verbose: bool = False, force_seed_only: bool = False) -> int:
+def process_once(
+    cfg: dict[str, Any],
+    verbose: bool = False,
+    force_seed_only: bool = False,
+    trace: bool = False,
+) -> dict[str, int | bool]:
     state = load_json(
         STATE_PATH,
         {"seen": {}, "bootstrapped": False, "last_poll_at": None, "updated_at": None},
@@ -271,23 +404,28 @@ def process_once(cfg: dict[str, Any], verbose: bool = False, force_seed_only: bo
         state["last_poll_at"] = poll_started_at
         state["updated_at"] = poll_started_at
         save_json(STATE_PATH, state)
-        return 0
+        return {"translated_count": 0, "activity_count": 0, "seeded": True}
 
     client = beeper_client(cfg["beeper_access_token"])
     translated_count = 0
+    activity_count = 0
 
     ignored_networks = {str(x).strip().lower() for x in cfg.get("ignored_networks", []) if str(x).strip()}
     ignored_chat_ids = {str(x).strip() for x in cfg.get("ignored_chat_ids", []) if str(x).strip()}
     ignored_title_contains = [str(x).strip().lower() for x in cfg.get("ignored_chat_title_contains", []) if str(x).strip()]
+    ignored_sender_names = {normalize_name(x) for x in cfg.get("ignored_sender_names", []) if normalize_name(x)}
+    ignored_sender_name_contains = [normalize_text(x) for x in cfg.get("ignored_sender_name_contains", []) if normalize_text(x)]
+    target_sender_name = normalize_name(str(cfg.get("discord_target") or ""))
+    if target_sender_name:
+        ignored_sender_names.add(target_sender_name)
 
-    try:
-        chats = list(client.chats.list())
-    except Exception as e:
-        if verbose and cfg.get("log_chat_skips", False):
-            print(f"[warn] Could not list chats: {e}")
-        chats = []
-
-    chat_by_id = {str(getattr(c, "id", "")): c for c in chats}
+    chat_cache: dict[str, dict[str, Any]] = cfg.setdefault("_runtime_chat_cache", {})
+    chat_ttl_s = max(10, int(cfg.get("chat_metadata_ttl_seconds", 900)))
+    chat_error_ttl_s = max(5, int(cfg.get("chat_metadata_error_ttl_seconds", 120)))
+    chat_max_entries = max(100, int(cfg.get("chat_metadata_max_entries", 2000)))
+    recent_sent_cache: dict[str, int] = cfg.setdefault("_runtime_recent_sent_texts", {})
+    recent_sent_ttl_s = max(30, int(cfg.get("recent_sent_ttl_seconds", 900)))
+    recent_sent_max_entries = max(20, int(cfg.get("recent_sent_max_entries", 200)))
 
     date_after = state.get("last_poll_at") or poll_started_at
     limit = max(1, min(20, int(cfg.get("search_limit", 20))))
@@ -296,7 +434,7 @@ def process_once(cfg: dict[str, Any], verbose: bool = False, force_seed_only: bo
         recent_messages = list(
             client.messages.search(
                 date_after=date_after,
-                include_muted=True,
+                include_muted=not bool(cfg.get("ignore_muted_chats", True)),
                 limit=limit,
                 direction="after",
             )
@@ -311,40 +449,144 @@ def process_once(cfg: dict[str, Any], verbose: bool = False, force_seed_only: bo
 
     recent_messages.sort(key=msg_ts)
 
+    def prune_recent_sent_cache(now_value: int | None = None) -> None:
+        now_epoch_value = now_epoch() if now_value is None else now_value
+        expired = [k for k, ts in recent_sent_cache.items() if now_epoch_value - int(ts) >= recent_sent_ttl_s]
+        for k in expired:
+            recent_sent_cache.pop(k, None)
+        if len(recent_sent_cache) <= recent_sent_max_entries:
+            return
+        oldest = sorted(recent_sent_cache.items(), key=lambda item: int(item[1]))
+        drop_n = len(recent_sent_cache) - recent_sent_max_entries
+        for k, _ in oldest[:drop_n]:
+            recent_sent_cache.pop(k, None)
+
+    def remember_recent_sent(text: str) -> None:
+        key = normalize_text(text)
+        if not key:
+            return
+        now_value = now_epoch()
+        recent_sent_cache[key] = now_value
+        prune_recent_sent_cache(now_value)
+
+    def is_recently_sent_echo(text: str) -> bool:
+        if not cfg.get("ignore_recently_sent_echoes", True):
+            return False
+        prune_recent_sent_cache()
+        key = normalize_text(text)
+        return bool(key and key in recent_sent_cache)
+
+    def prune_chat_cache() -> None:
+        if len(chat_cache) <= chat_max_entries:
+            return
+        # Drop oldest cache entries first.
+        oldest = sorted(
+            ((cid, int(meta.get("cached_at_epoch", 0))) for cid, meta in chat_cache.items()),
+            key=lambda item: item[1],
+        )
+        drop_n = len(chat_cache) - chat_max_entries
+        for cid, _ in oldest[:drop_n]:
+            chat_cache.pop(cid, None)
+
+    def get_chat(chat_id: str) -> Any:
+        if not chat_id:
+            return None
+        now = now_epoch()
+        cached = chat_cache.get(chat_id)
+        if cached:
+            cached_at = int(cached.get("cached_at_epoch", 0))
+            cached_chat = cached.get("chat")
+            ttl = chat_ttl_s if cached_chat is not None else chat_error_ttl_s
+            if now - cached_at < ttl:
+                return cached_chat
+        try:
+            chat = client.chats.retrieve(chat_id)
+            chat_cache[chat_id] = {"chat": chat, "cached_at_epoch": now}
+            prune_chat_cache()
+            return chat
+        except Exception as e:
+            if verbose and cfg.get("log_chat_skips", False):
+                print(f"[warn] Could not retrieve chat metadata for {chat_id}: {e}")
+            # Cache lookup failures briefly to avoid hammering.
+            chat_cache[chat_id] = {"chat": None, "cached_at_epoch": now}
+            prune_chat_cache()
+            return None
+
     for msg in recent_messages:
+        chat_id = str(getattr(msg, "chat_id", "") or "")
+
+        def trace_msg(reason: str) -> None:
+            if not trace:
+                return
+            sender = getattr(msg, "sender_name", None) or getattr(msg, "sender_id", "unknown")
+            text = (getattr(msg, "text", "") or "").strip().replace("\n", " ")
+            text_preview = text[:120]
+            msg_id = getattr(msg, "id", "") or message_key(msg)
+            print(f"[trace] {reason} | id={msg_id} | chat={chat_id or '?'} | sender={sender} | text={text_preview!r}")
+
         if getattr(msg, "is_sender", False):
+            trace_msg("SKIP_SELF")
             continue
 
         key = message_key(msg)
         if key in seen:
+            trace_msg("SKIP_SEEN")
             continue
 
-        chat_id = str(getattr(msg, "chat_id", "") or "")
-        chat = chat_by_id.get(chat_id)
+        activity_count += 1
+
+        chat = get_chat(chat_id)
         chat_network = str(getattr(chat, "network", "") or "").lower() if chat else ""
         chat_title = str(getattr(chat, "title", "") or "") if chat else chat_id
-        chat_muted = bool(getattr(chat, "is_muted", False) or getattr(chat, "muted", False)) if chat else False
+        chat_muted = is_chat_muted(chat)
+        sender = getattr(msg, "sender_name", None) or getattr(msg, "sender_id", "unknown")
+        sender_name_norm = normalize_name(sender)
 
         if cfg.get("ignore_muted_chats", True) and chat_muted:
+            trace_msg("SKIP_MUTED")
+            continue
+        if cfg.get("ignore_muted_chats", True) and not chat and cfg.get("drop_messages_without_chat_metadata", True):
+            if verbose and cfg.get("log_chat_skips", False):
+                print(f"[skip] Unknown chat metadata; dropped while mute filtering is enabled: {chat_id}")
+            trace_msg("SKIP_UNKNOWN_CHAT_METADATA")
             continue
         if chat_network and chat_network in ignored_networks:
+            trace_msg("SKIP_IGNORED_NETWORK")
             continue
         if chat_id and chat_id in ignored_chat_ids:
+            trace_msg("SKIP_IGNORED_CHAT_ID")
             continue
         if chat_title and any(snippet in chat_title.lower() for snippet in ignored_title_contains):
+            trace_msg("SKIP_IGNORED_CHAT_TITLE")
+            continue
+        if sender_name_norm and sender_name_norm in ignored_sender_names:
+            trace_msg("SKIP_IGNORED_SENDER")
+            continue
+        if sender_name_norm and any(snippet in sender_name_norm for snippet in ignored_sender_name_contains):
+            trace_msg("SKIP_IGNORED_SENDER_CONTAINS")
             continue
 
         text = (getattr(msg, "text", "") or "").strip()
         if not text:
             seen[key] = {"first_seen_epoch": now_epoch()}
+            trace_msg("SKIP_EMPTY_TEXT")
+            continue
+        if is_recently_sent_echo(text):
+            seen[key] = {"first_seen_epoch": now_epoch()}
+            trace_msg("SKIP_RECENTLY_SENT_ECHO")
             continue
 
         seen[key] = {"first_seen_epoch": now_epoch()}
-        sender = getattr(msg, "sender_name", None) or getattr(msg, "sender_id", "unknown")
 
         if likely_english_with_tiny_spanish_tail(text, cfg.get("from_language", "Spanish")):
             if verbose and cfg.get("log_ignored_messages", False):
                 print(f"[skip] MIXED-ENGLISH: {sender}: {text[:80]}")
+            trace_msg("SKIP_MIXED_ENGLISH_TAIL")
+            continue
+        if likely_english_not_spanish(text, cfg.get("from_language", "Spanish")):
+            if verbose and cfg.get("log_ignored_messages", False):
+                print(f"[skip] ENGLISH-HEURISTIC: {sender}: {text[:80]}")
+            trace_msg("SKIP_ENGLISH_HEURISTIC")
             continue
 
         try:
@@ -359,15 +601,22 @@ def process_once(cfg: dict[str, Any], verbose: bool = False, force_seed_only: bo
         except Exception as e:
             if verbose:
                 print(f"[warn] LM Studio classify failed for {key}: {e}")
+            trace_msg("SKIP_LLM_ERROR")
             continue
 
         if result == "IGNORE":
             if verbose and cfg.get("log_ignored_messages", False):
                 print(f"[skip] IGNORE: {sender}: {text[:80]}")
+            trace_msg("SKIP_LLM_IGNORE")
             continue
 
         if result.startswith("TRANSLATED:"):
             translation = result.split("TRANSLATED:", 1)[1].strip()
+            if not should_accept_translation(text, translation, cfg.get("from_language", "Spanish")):
+                if verbose and cfg.get("log_ignored_messages", False):
+                    print(f"[skip] NO-OP-TRANSLATION: {sender}: {text[:80]}")
+                trace_msg("SKIP_NOOP_TRANSLATION")
+                continue
             out = f"{cfg.get('output_flag', '🇲🇽')} {translation} — {sender}"
             try:
                 send_to_discord(
@@ -376,22 +625,26 @@ def process_once(cfg: dict[str, Any], verbose: bool = False, force_seed_only: bo
                     out,
                     retries=int(cfg.get("send_retries", 3)),
                 )
+                remember_recent_sent(out)
                 translated_count += 1
                 if verbose:
                     print(f"[sent] {out}")
+                trace_msg("SEND_TRANSLATION")
             except Exception as e:
                 print(f"[error] Discord send failed for {key}: {e}")
+                trace_msg("SKIP_DISCORD_SEND_ERROR")
             continue
 
         if verbose:
             print(f"[skip] Unrecognized model output: {result!r}")
+        trace_msg("SKIP_UNRECOGNIZED_MODEL_OUTPUT")
 
     state["seen"] = seen
     state["bootstrapped"] = True
     state["last_poll_at"] = poll_started_at
     state["updated_at"] = now_iso()
     save_json(STATE_PATH, state)
-    return translated_count
+    return {"translated_count": translated_count, "activity_count": activity_count, "seeded": False}
 
 
 def choose_model_interactive(default_model: str) -> str:
@@ -583,19 +836,62 @@ def apply_runtime_path_fallbacks(cfg: dict[str, Any], verbose: bool = False) -> 
 
 def cmd_run(args: argparse.Namespace) -> None:
     cfg = apply_runtime_path_fallbacks(load_config(), verbose=args.verbose)
-    interval = int(args.interval) if args.interval is not None else int(cfg.get("interval_seconds"))
+    normal_interval = max(2, int(args.interval) if args.interval is not None else int(cfg.get("interval_seconds")))
+    adaptive = bool(cfg.get("adaptive_polling", True))
+    active_interval = max(2, min(normal_interval, int(cfg.get("active_interval_seconds", 3))))
+    active_window_s = max(0, int(cfg.get("active_window_seconds", 60)))
+    medium_idle_after_s = max(active_window_s, int(cfg.get("medium_idle_after_seconds", 300)))
+    idle_interval = max(normal_interval, int(cfg.get("idle_interval_seconds", 20)))
+    max_idle_after_s = max(medium_idle_after_s, int(cfg.get("max_idle_after_seconds", 1800)))
+    max_interval = max(idle_interval, int(cfg.get("max_interval_seconds", 60)))
+    last_activity_epoch: int | None = None
+    current_sleep = normal_interval
 
     while True:
         try:
-            process_once(cfg, verbose=args.verbose, force_seed_only=args.seed_seen)
+            stats = process_once(cfg, verbose=args.verbose, force_seed_only=args.seed_seen, trace=args.trace)
+            if int(stats.get("activity_count", 0)) > 0:
+                last_activity_epoch = now_epoch()
         except Exception as e:
             print(f"[error] loop failure: {e}")
-        time.sleep(max(2, interval))
+            stats = {"translated_count": 0, "activity_count": 0, "seeded": False}
+
+        next_sleep = normal_interval
+        if adaptive and not bool(stats.get("seeded", False)) and last_activity_epoch is not None:
+            idle_for = max(0, now_epoch() - last_activity_epoch)
+            if idle_for <= active_window_s:
+                next_sleep = active_interval
+            elif idle_for <= medium_idle_after_s:
+                next_sleep = normal_interval
+            elif idle_for <= max_idle_after_s:
+                next_sleep = idle_interval
+            else:
+                next_sleep = max_interval
+
+        if args.verbose and next_sleep != current_sleep:
+            print(
+                f"[info] Poll interval now {next_sleep}s"
+                f" (activity={int(stats.get('activity_count', 0))}, translated={int(stats.get('translated_count', 0))})"
+            )
+        current_sleep = next_sleep
+        time.sleep(current_sleep)
 
 
 def cmd_once(args: argparse.Namespace) -> None:
     cfg = apply_runtime_path_fallbacks(load_config(), verbose=args.verbose)
-    process_once(cfg, verbose=args.verbose, force_seed_only=args.seed_seen)
+    process_once(cfg, verbose=args.verbose, force_seed_only=args.seed_seen, trace=args.trace)
+
+
+def cmd_restart(_args: argparse.Namespace) -> None:
+    if sys.platform != "darwin":
+        raise RuntimeError("restart is only supported on macOS launchd.")
+
+    domain = f"gui/{os.getuid()}"
+    target = f"{domain}/{LAUNCHD_LABEL}"
+    proc = subprocess.run(["launchctl", "kickstart", "-k", target], capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or f"failed to restart {target}")
+    print(f"Restarted launchd service: {target}")
 
 
 def cmd_doctor(_args: argparse.Namespace) -> None:
@@ -675,6 +971,7 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         p = sub.add_parser(name, help=help_text)
         p.add_argument("--verbose", action="store_true", help="Verbose logs")
+        p.add_argument("--trace", action="store_true", help="Trace per-message decision path")
         p.add_argument("--seed-seen", action="store_true", help="Force seed mode (mark seen, send nothing)")
         p.add_argument("--interval", type=int, default=None, help="Loop interval seconds (run only)") if name == "run" else None
         p.set_defaults(func=fn)
@@ -686,6 +983,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_uninstall.add_argument("--delete-config", action="store_true", help="Also delete config file")
     p_uninstall.add_argument("--delete-state", action="store_true", help="Also delete dedupe state file")
     p_uninstall.set_defaults(func=cmd_uninstall)
+
+    p_restart = sub.add_parser("restart", help="Restart launchd service via launchctl kickstart -k")
+    p_restart.set_defaults(func=cmd_restart)
 
     return parser
 

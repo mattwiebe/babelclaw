@@ -1,12 +1,16 @@
 # BabelClaw
 
-Language-aware Beeper bridge that uses local LM Studio inference to translate inbound messages and forward translated output to Discord through OpenClaw.
+Inbound foreign language messages get a followup auto-translation message sent to you, using Beeper Desktop and LM Studio.
+
+BabelClaw is a language-aware Beeper bridge that uses local LM Studio inference to translate inbound messages and forward translated output to Discord through OpenClaw.
 
 ## What it does
 
 - Watches Beeper Desktop API for new inbound messages
 - Filters chats with guardrails (muted chats, ignored networks, ignored chat IDs/title patterns)
+- Uses fail-safe muted filtering: excludes muted chats at API query time and drops messages when chat metadata cannot be resolved (configurable)
 - Classifies/translates with LM Studio (configurable FROM/TO language)
+- Applies local English-vs-Spanish heuristics before LLM calls to reduce false-positive translations
 - Sends translated messages to Discord via `openclaw message send`
 - Uses 24h dedupe state to avoid duplicates
 - Runs as a macOS launchd daemon
@@ -39,10 +43,22 @@ This will:
 uv run --script babelclaw-daemon.py run --verbose
 ```
 
+Trace decisions in detail:
+
+```bash
+uv run --script babelclaw-daemon.py run --verbose --trace
+```
+
 One pass only:
 
 ```bash
 uv run --script babelclaw-daemon.py once --verbose
+```
+
+Restart launchd service (macOS):
+
+```bash
+uv run --script babelclaw-daemon.py restart
 ```
 
 ## Uninstall
